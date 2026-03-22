@@ -89,6 +89,9 @@ _TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>",
     re.DOTALL,
 )
+_PLAIN_TOOL_LINE_RE = re.compile(
+    r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<args>\{.*\})\s*$"
+)
 
 
 def _strip_code_fences(text: str) -> str:
@@ -183,13 +186,7 @@ def parse_tool_call_block(
     if not name:
         return None
 
-    valid_names = set()
-    if tools:
-        for tool in tools:
-            func = tool.get("function", {})
-            tool_name = func.get("name")
-            if tool_name:
-                valid_names.add(tool_name)
+    valid_names = _valid_tool_names(tools)
     if valid_names and name not in valid_names:
         return None
 
@@ -205,6 +202,61 @@ def parse_tool_call_block(
         "type": "function",
         "function": {"name": name, "arguments": arguments_str},
     }
+
+
+def _valid_tool_names(tools: Optional[List[Dict[str, Any]]]) -> set[str]:
+    names: set[str] = set()
+    for tool in tools or []:
+        func = tool.get("function", {})
+        tool_name = func.get("name")
+        if isinstance(tool_name, str) and tool_name:
+            names.add(tool_name)
+    return names
+
+
+def _parse_plain_tool_calls(
+    content: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
+    valid_names = _valid_tool_names(tools)
+    text_lines: list[str] = []
+    tool_calls: list[Dict[str, Any]] = []
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _PLAIN_TOOL_LINE_RE.match(line)
+        if not match:
+            text_lines.append(raw_line)
+            continue
+
+        name = match.group("name")
+        if valid_names and name not in valid_names:
+            text_lines.append(raw_line)
+            continue
+
+        args = _repair_json(match.group("args"))
+        if not isinstance(args, dict):
+            text_lines.append(raw_line)
+            continue
+
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            }
+        )
+
+    if not tool_calls:
+        return content, None
+
+    text_content = "\n".join(line for line in text_lines if line.strip()) or None
+    return text_content, tool_calls
 
 
 def parse_tool_calls(
@@ -230,7 +282,7 @@ def parse_tool_calls(
 
     matches = list(_TOOL_CALL_RE.finditer(content))
     if not matches:
-        return content, None
+        return _parse_plain_tool_calls(content, tools)
 
     tool_calls = []
     for match in matches:

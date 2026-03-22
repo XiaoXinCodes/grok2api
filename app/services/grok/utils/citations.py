@@ -9,6 +9,7 @@ from typing import Any
 import orjson
 
 CITATION_CARD_TYPE = "citation_card"
+TITLE_KEYS = ("title", "name", "label", "displayTitle", "display_name")
 SEARCH_RESULT_FIELDS = (
     "citedWebSearchResults",
     "webSearchResults",
@@ -143,11 +144,10 @@ def _extract_source_from_card(
     if not isinstance(card, dict):
         return None
 
-    card_type = _normalize_str(card.get("cardType") or card.get("card_type"))
-    if card_type != CITATION_CARD_TYPE:
+    if not _is_citation_card(card):
         return None
 
-    url = _normalize_str(card.get("url"))
+    url = _find_card_url(card)
     if not url.startswith(("http://", "https://")):
         return None
 
@@ -156,18 +156,14 @@ def _extract_source_from_card(
 
     title = _normalize_title(
         result_meta.get("title")
-        or card.get("title")
-        or card.get("name")
-        or card.get("label")
+        or _find_card_title(card)
     )
     if title:
         source["title"] = title
 
     description = _normalize_str(
         result_meta.get("description")
-        or card.get("description")
-        or card.get("snippet")
-        or card.get("content")
+        or _find_card_description(card)
     )
     if description:
         source["description"] = description
@@ -187,6 +183,102 @@ def _parse_card(raw_card: Any) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
     return parsed
+
+
+def _is_citation_card(card: dict[str, Any]) -> bool:
+    candidates = [
+        card.get("cardType"),
+        card.get("card_type"),
+        card.get("data-type"),
+        card.get("dataType"),
+        card.get("type"),
+    ]
+    for value in candidates:
+        text = _normalize_str(value).lower()
+        if text == CITATION_CARD_TYPE or "citation" in text:
+            return True
+    return False
+
+
+def _find_card_url(card: dict[str, Any]) -> str:
+    direct = _normalize_str(card.get("url") or card.get("href") or card.get("link"))
+    if direct.startswith(("http://", "https://")):
+        return direct
+
+    for value in _walk_values(card):
+        text = _normalize_str(value)
+        if text.startswith(("http://", "https://")):
+            return text
+    return ""
+
+
+def _find_card_title(card: dict[str, Any]) -> str:
+    for key in TITLE_KEYS:
+        title = _normalize_title(card.get(key))
+        if title:
+            return title
+
+    for key, value in _walk_items(card):
+        if key in TITLE_KEYS:
+            title = _normalize_title(value)
+            if title:
+                return title
+    return ""
+
+
+def _find_card_description(card: dict[str, Any]) -> str:
+    candidates = (
+        card.get("description"),
+        card.get("snippet"),
+        card.get("content"),
+        card.get("summary"),
+    )
+    for value in candidates:
+        text = _normalize_str(value)
+        if text:
+            return text
+
+    for key, value in _walk_items(card):
+        if key in {"description", "snippet", "content", "summary"}:
+            text = _normalize_str(value)
+            if text:
+                return text
+    return ""
+
+
+def _walk_values(value: Any) -> list[Any]:
+    values: list[Any] = []
+    stack: list[Any] = [value]
+
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            stack.extend(current.values())
+            continue
+        if isinstance(current, list):
+            stack.extend(current)
+            continue
+        values.append(current)
+
+    return values
+
+
+def _walk_items(value: Any) -> list[tuple[str, Any]]:
+    items: list[tuple[str, Any]] = []
+    stack: list[Any] = [value]
+
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if isinstance(key, str):
+                    items.append((key, child))
+                stack.append(child)
+            continue
+        if isinstance(current, list):
+            stack.extend(current)
+
+    return items
 
 
 def _normalize_str(value: Any) -> str:

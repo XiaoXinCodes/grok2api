@@ -32,6 +32,12 @@ from app.services.grok.utils.tool_call import (
     parse_tool_call_block,
     format_tool_history,
 )
+from app.services.grok.utils.citations import (
+    append_sources_markdown,
+    extract_sources_from_card_attachment,
+    extract_sources_from_model_response,
+    merge_sources,
+)
 from app.services.token import get_token_manager, EffortType
 
 
@@ -531,6 +537,7 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_partial = ""
         self._tool_calls_seen = False
         self._tool_call_index = 0
+        self._sources: list[dict[str, str]] = []
 
     def _with_tool_index(self, tool_call: Any) -> Any:
         if not isinstance(tool_call, dict):
@@ -768,6 +775,10 @@ class StreamProcessor(proc_base.BaseProcessor):
                     continue
 
                 if mr := resp.get("modelResponse"):
+                    self._sources = merge_sources(
+                        self._sources,
+                        extract_sources_from_model_response(mr),
+                    )
                     if self.image_think_active and self.think_opened:
                         yield self._sse("\n</think>\n")
                         self.think_opened = False
@@ -791,6 +802,10 @@ class StreamProcessor(proc_base.BaseProcessor):
                     continue
 
                 if card := resp.get("cardAttachment"):
+                    self._sources = merge_sources(
+                        self._sources,
+                        extract_sources_from_card_attachment(card),
+                    )
                     json_data = card.get("jsonData")
                     if isinstance(json_data, str) and json_data.strip():
                         try:
@@ -850,6 +865,10 @@ class StreamProcessor(proc_base.BaseProcessor):
             if self.think_opened:
                 yield self._sse("</think>\n")
                 self.think_closed_once = True
+
+            sources_block = append_sources_markdown("", self._sources).strip()
+            if sources_block:
+                yield self._sse(f"\n\n{sources_block}\n")
 
             if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
@@ -946,6 +965,7 @@ class CollectProcessor(proc_base.BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
+        sources: list[dict[str, str]] = []
         idle_timeout = get_config("chat.stream_timeout")
 
         try:
@@ -968,6 +988,10 @@ class CollectProcessor(proc_base.BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     response_id = mr.get("responseId", "")
                     content = mr.get("message", "")
+                    sources = merge_sources(
+                        sources,
+                        extract_sources_from_model_response(mr),
+                    )
 
                     card_map: dict[str, tuple[str, str]] = {}
                     for raw in mr.get("cardAttachmentsJson") or []:
@@ -1027,6 +1051,12 @@ class CollectProcessor(proc_base.BaseProcessor):
                     ):
                         fingerprint = meta["llm_info"]["modelHash"]
 
+                if card := resp.get("cardAttachment"):
+                    sources = merge_sources(
+                        sources,
+                        extract_sources_from_card_attachment(card),
+                    )
+
         except asyncio.CancelledError:
             logger.debug("Collect cancelled by client", extra={"model": self.model})
             raise
@@ -1065,6 +1095,7 @@ class CollectProcessor(proc_base.BaseProcessor):
             await self.close()
 
         content = self._filter_content(content)
+        content = append_sources_markdown(content, sources)
 
         # Parse for tool calls if tools were provided
         finish_reason = "stop"

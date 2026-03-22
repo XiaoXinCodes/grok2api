@@ -1,6 +1,9 @@
 services:
   grok2api:
     container_name: grok2api
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: ghcr.io/chenyme/grok2api:latest
     ports:
       - "${HOST_PORT:-8000}:${SERVER_PORT:-8000}"

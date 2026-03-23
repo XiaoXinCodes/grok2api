@@ -179,52 +179,72 @@ def _imagine_fast_server_image_config() -> ImageConfig:
     return ImageConfig(n=n, size=size, response_format=response_format)
 
 
-async def _safe_sse_stream(stream: AsyncIterable[str]) -> AsyncGenerator[str, None]:
-    """Ensure streaming endpoints return SSE error payloads instead of transport-level 5xx breaks."""
-    try:
-        async for chunk in stream:
-            yield chunk
-    except AppException as e:
-        payload = {
-            "error": {
-                "message": e.message,
-                "type": e.error_type,
-                "code": e.code,
-            }
-        }
-        yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
-        yield "data: [DONE]\n\n"
-    except Exception as e:
-        payload = {
-            "error": {
-                "message": str(e) or "stream_error",
-                "type": "server_error",
-                "code": "stream_error",
-            }
-        }
-        yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
-        yield "data: [DONE]\n\n"
-
-
-def _streaming_error_response(exc: Exception) -> StreamingResponse:
+def _stream_error_payload(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, AppException):
-        payload = {
+        return {
             "error": {
                 "message": exc.message,
                 "type": exc.error_type,
                 "code": exc.code,
             }
         }
-    else:
-        payload = {
-            "error": {
-                "message": str(exc) or "stream_error",
-                "type": "server_error",
-                "code": "stream_error",
-            }
+    return {
+        "error": {
+            "message": str(exc) or "stream_error",
+            "type": "server_error",
+            "code": "stream_error",
         }
+    }
+
+
+def _stream_error_text(exc: Exception) -> str:
+    payload = _stream_error_payload(exc)
+    message = payload["error"]["message"]
+    return f"[stream_error] {message}"
+
+
+def _stream_error_chunk(message: str, model: str) -> str:
+    chunk = {
+        "id": f"chatcmpl-error-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": message},
+                "logprobs": None,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    return f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+
+async def _safe_sse_stream(
+    stream: AsyncIterable[str], model: str = ""
+) -> AsyncGenerator[str, None]:
+    """Ensure streaming endpoints return SSE error payloads instead of transport-level 5xx breaks."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    except AppException as e:
+        payload = _stream_error_payload(e)
+        yield _stream_error_chunk(_stream_error_text(e), model)
+        yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        payload = _stream_error_payload(e)
+        yield _stream_error_chunk(_stream_error_text(e), model)
+        yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+def _streaming_error_response(exc: Exception) -> StreamingResponse:
+    payload = _stream_error_payload(exc)
 
     async def _one_shot_error() -> AsyncGenerator[str, None]:
+        yield _stream_error_chunk(_stream_error_text(exc), "")
         yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -741,7 +761,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         if result.stream:
             return StreamingResponse(
-                _safe_sse_stream(result.data),
+                _safe_sse_stream(result.data, request.model),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
@@ -804,7 +824,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         if result.stream:
             return StreamingResponse(
-                _safe_sse_stream(result.data),
+                _safe_sse_stream(result.data, request.model),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
@@ -856,7 +876,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return JSONResponse(content=result)
     else:
         return StreamingResponse(
-            _safe_sse_stream(result),
+            _safe_sse_stream(result, request.model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )

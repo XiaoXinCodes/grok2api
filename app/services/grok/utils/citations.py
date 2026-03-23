@@ -57,17 +57,13 @@ def extract_sources_from_model_response(
         if source:
             sources.append(source)
 
-    if sources:
-        return merge_sources(sources)
-
-    fallback: list[dict[str, str]] = []
-    for field in ("citedWebSearchResults", "citedRagResults"):
+    for field in SEARCH_RESULT_FIELDS:
         for item in model_response.get(field) or []:
             normalized = _normalize_result_item(item)
             if normalized:
-                fallback.append(normalized)
+                sources.append(normalized)
 
-    return merge_sources(fallback)
+    return merge_sources(sources)
 
 
 def extract_sources_from_card_attachment(
@@ -76,7 +72,9 @@ def extract_sources_from_card_attachment(
     """Extract cited sources from a streaming cardAttachment event."""
     if not isinstance(card_attachment, dict):
         return []
-    source = _extract_source_from_card(card_attachment.get("jsonData"))
+    source = _extract_source_from_card(
+        card_attachment.get("jsonData") or card_attachment
+    )
     if not source:
         return []
     return [source]

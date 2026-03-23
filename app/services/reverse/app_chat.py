@@ -47,6 +47,18 @@ class AppChatReverse:
         return value
 
     @staticmethod
+    def _merge_custom_personality(
+        custom_personality_override: Optional[str],
+    ) -> Optional[str]:
+        base = AppChatReverse._resolve_custom_personality()
+        override = (custom_personality_override or "").strip()
+        if not override:
+            return base
+        if not base:
+            return override
+        return f"{base}\n\n{override}"
+
+    @staticmethod
     def build_payload(
         message: str,
         model: str,
@@ -54,6 +66,8 @@ class AppChatReverse:
         file_attachments: List[str] = None,
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
+        payload_overrides: Dict[str, Any] = None,
+        custom_personality_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build chat payload for Grok app-chat API."""
 
@@ -98,12 +112,16 @@ class AppChatReverse:
         if model == "grok-420":
             payload["enable420"] = True
 
-        custom_personality = AppChatReverse._resolve_custom_personality()
+        custom_personality = AppChatReverse._merge_custom_personality(
+            custom_personality_override
+        )
         if custom_personality is not None:
             payload["customPersonality"] = custom_personality
 
         if model_config_override:
             payload["responseMetadata"]["modelConfigOverride"] = model_config_override
+        if payload_overrides:
+            payload.update(payload_overrides)
 
         import json
         logger.debug(f"AppChatReverse payload: {json.dumps(payload, indent=4, ensure_ascii=False)}")
@@ -120,6 +138,10 @@ class AppChatReverse:
         file_attachments: List[str] = None,
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
+        payload_overrides: Dict[str, Any] = None,
+        timeout_override: float | None = None,
+        reverse_max_retry: int | None = None,
+        custom_personality_override: Optional[str] = None,
     ) -> Any:
         """Send app chat request to Grok.
         
@@ -153,11 +175,13 @@ class AppChatReverse:
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
+                payload_overrides=payload_overrides,
+                custom_personality_override=custom_personality_override,
             )
             payload_summary = {
                 "model": payload.get("modelName"),
                 "mode": payload.get("modelMode"),
-                "message_len": payload.get("message") or "",
+                "message_len": len(payload.get("message") or ""),
                 "file_attachments": len(payload.get("fileAttachments") or []),
                 "custom_personality_len": len(payload.get("customPersonality") or ""),
             }
@@ -167,7 +191,9 @@ class AppChatReverse:
             )
 
             # Curl Config
-            timeout = float(get_config("chat.timeout") or 0)
+            timeout = float(timeout_override or 0)
+            if timeout <= 0:
+                timeout = float(get_config("chat.timeout") or 0)
             if timeout <= 0:
                 timeout = max(
                     float(get_config("video.timeout") or 0),
@@ -245,6 +271,7 @@ class AppChatReverse:
                 _do_request,
                 extract_status=extract_status,
                 on_retry=_on_retry,
+                max_retry=reverse_max_retry,
             )
 
             # Stream response

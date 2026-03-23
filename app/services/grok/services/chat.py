@@ -38,6 +38,10 @@ from app.services.grok.utils.citations import (
     extract_sources_from_model_response,
     merge_sources,
 )
+from app.services.grok.utils.client_compat import (
+    ClientCompatOptions,
+    detect_client_compat,
+)
 from app.services.token import get_token_manager, EffortType
 
 
@@ -111,8 +115,71 @@ def _get_chat_semaphore() -> asyncio.Semaphore:
     return _CHAT_SEMAPHORE
 
 
+def _resolve_max_token_retries(compat: ClientCompatOptions | None) -> int:
+    if compat and compat.max_token_retries is not None:
+        return max(1, int(compat.max_token_retries))
+    return max(1, int(get_config("retry.max_retry") or 3))
+
+
+def _resolve_chat_idle_timeout(compat: ClientCompatOptions | None) -> float:
+    if compat and compat.stream_idle_timeout is not None:
+        return float(compat.stream_idle_timeout)
+    return float(get_config("chat.stream_timeout") or 0)
+
+
 class MessageExtractor:
     """消息内容提取器"""
+
+    @staticmethod
+    def extract_role_text(
+        messages: List[Dict[str, Any]],
+        roles: tuple[str, ...],
+    ) -> str:
+        role_set = {role for role in roles if role}
+        if not role_set:
+            return ""
+        parts: List[str] = []
+        for message in messages:
+            role = message.get("role", "") or "user"
+            if role not in role_set:
+                continue
+            text = MessageExtractor._extract_text_content(message.get("content"))
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def without_roles(
+        messages: List[Dict[str, Any]],
+        roles: tuple[str, ...],
+    ) -> List[Dict[str, Any]]:
+        role_set = {role for role in roles if role}
+        if not role_set:
+            return list(messages)
+        return [
+            message
+            for message in messages
+            if (message.get("role", "") or "user") not in role_set
+        ]
+
+    @staticmethod
+    def _extract_text_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            return ""
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "text":
+                continue
+            text = item.get("text", "")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts)
 
     @staticmethod
     def extract(
@@ -268,6 +335,10 @@ class GrokChatService:
         file_attachments: List[str] = None,
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
+        payload_overrides: Dict[str, Any] = None,
+        timeout_override: float | None = None,
+        reverse_max_retry: int | None = None,
+        custom_personality_override: str | None = None,
     ):
         """发送聊天请求"""
         if stream is None:
@@ -291,6 +362,10 @@ class GrokChatService:
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
+                payload_overrides=payload_overrides,
+                timeout_override=timeout_override,
+                reverse_max_retry=reverse_max_retry,
+                custom_personality_override=custom_personality_override,
             )
             logger.info(f"Chat connected: model={model}, stream={stream}")
         except Exception:
@@ -322,6 +397,7 @@ class GrokChatService:
         tools: List[Dict[str, Any]] = None,
         tool_choice: Any = None,
         parallel_tool_calls: bool = True,
+        compat: ClientCompatOptions | None = None,
     ):
         """OpenAI 兼容接口"""
         model_info = ModelService.get(model)
@@ -330,15 +406,30 @@ class GrokChatService:
 
         grok_model = model_info.grok_model
         mode = model_info.model_mode
+        compat = compat or ClientCompatOptions()
+        prompt_messages = messages
+        custom_personality_override = None
+        if compat.custom_personality_roles:
+            custom_personality_override = MessageExtractor.extract_role_text(
+                messages, compat.custom_personality_roles
+            )
+            if custom_personality_override:
+                prompt_messages = MessageExtractor.without_roles(
+                    messages, compat.custom_personality_roles
+                )
         # 提取消息和附件
         message, file_attachments, image_attachments = MessageExtractor.extract(
-            messages, tools=tools, tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls
+            prompt_messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
         logger.debug(
-            "Extracted message length=%s, files=%s, images=%s",
+            "Extracted message length=%s, files=%s, images=%s, custom_personality=%s",
             len(message),
             len(file_attachments),
             len(image_attachments),
+            bool(custom_personality_override),
         )
 
         # 上传附件
@@ -367,6 +458,19 @@ class GrokChatService:
         }
         if reasoning_effort is not None:
             model_config_override["reasoningEffort"] = reasoning_effort
+        elif compat.suppress_think:
+            model_config_override["reasoningEffort"] = "none"
+        payload_overrides = None
+        if compat.suppress_media:
+            payload_overrides = {
+                "enableImageGeneration": False,
+                "enableImageStreaming": False,
+                "imageGenerationCount": 0,
+                "disableTextFollowUps": True,
+                "enableSideBySide": False,
+                "forceSideBySide": False,
+                "forceConcise": True,
+            }
 
         response = await self.chat(
             token,
@@ -377,6 +481,10 @@ class GrokChatService:
             file_attachments=all_attachments,
             tool_overrides=None,
             model_config_override=model_config_override,
+            payload_overrides=payload_overrides,
+            timeout_override=compat.request_timeout,
+            reverse_max_retry=compat.reverse_max_retry,
+            custom_personality_override=custom_personality_override,
         )
 
         return response, stream, model
@@ -403,15 +511,18 @@ class ChatService:
         await token_mgr.reload_if_stale()
 
         # 解析参数
+        compat = detect_client_compat(messages)
         if reasoning_effort is None:
             show_think = get_config("app.thinking")
         else:
             show_think = reasoning_effort != "none"
+        if compat.suppress_think:
+            show_think = False
         is_stream = stream if stream is not None else get_config("app.stream")
 
         # 跨 Token 重试循环
         tried_tokens = set()
-        max_token_retries = int(get_config("retry.max_retry") or 3)
+        max_token_retries = _resolve_max_token_retries(compat)
         last_error = None
 
         for attempt in range(max_token_retries):
@@ -443,19 +554,33 @@ class ChatService:
                     tools=tools,
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
+                    compat=compat,
                 )
 
                 # 处理响应
                 if is_stream:
                     logger.debug(f"Processing stream response: model={model}")
-                    processor = StreamProcessor(model_name, token, show_think, tools=tools, tool_choice=tool_choice)
+                    processor = StreamProcessor(
+                        model_name,
+                        token,
+                        show_think,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        compat=compat,
+                    )
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
                     )
 
                 # 非流式
                 logger.debug(f"Processing non-stream response: model={model}")
-                result = await CollectProcessor(model_name, token, tools=tools, tool_choice=tool_choice).process(response)
+                result = await CollectProcessor(
+                    model_name,
+                    token,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    compat=compat,
+                ).process(response)
                 try:
                     model_info = ModelService.get(model)
                     effort = (
@@ -512,7 +637,15 @@ class ChatService:
 class StreamProcessor(proc_base.BaseProcessor):
     """Stream response processor."""
 
-    def __init__(self, model: str, token: str = "", show_think: bool = None, tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        show_think: bool = None,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        compat: ClientCompatOptions | None = None,
+    ):
         super().__init__(model, token)
         self.response_id: str = None
         self.fingerprint: str = ""
@@ -538,6 +671,7 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_calls_seen = False
         self._tool_call_index = 0
         self._sources: list[dict[str, str]] = []
+        self.compat = compat or ClientCompatOptions()
 
     def _with_tool_index(self, tool_call: Any) -> Any:
         if not isinstance(tool_call, dict):
@@ -730,7 +864,7 @@ class StreamProcessor(proc_base.BaseProcessor):
         Returns:
             AsyncGenerator[str, None], async generator of strings
         """
-        idle_timeout = get_config("chat.stream_timeout")
+        idle_timeout = _resolve_chat_idle_timeout(self.compat)
 
         try:
             async for line in proc_base._with_idle_timeout(
@@ -761,6 +895,8 @@ class StreamProcessor(proc_base.BaseProcessor):
                     self.role_sent = True
 
                 if img := resp.get("streamingImageGenerationResponse"):
+                    if self.compat.suppress_media:
+                        continue
                     if not self.show_think:
                         continue
                     self.image_think_active = True
@@ -784,14 +920,15 @@ class StreamProcessor(proc_base.BaseProcessor):
                         self.think_opened = False
                         self.think_closed_once = True
                     self.image_think_active = False
-                    for url in proc_base._collect_images(mr):
-                        parts = url.split("/")
-                        img_id = parts[-2] if len(parts) >= 2 else "image"
-                        dl_service = self._get_dl()
-                        rendered = await dl_service.render_image(
-                            url, self.token, img_id
-                        )
-                        yield self._sse(f"{rendered}\n")
+                    if not self.compat.suppress_media:
+                        for url in proc_base._collect_images(mr):
+                            parts = url.split("/")
+                            img_id = parts[-2] if len(parts) >= 2 else "image"
+                            dl_service = self._get_dl()
+                            rendered = await dl_service.render_image(
+                                url, self.token, img_id
+                            )
+                            yield self._sse(f"{rendered}\n")
 
                     if (
                         (meta := mr.get("metadata", {}))
@@ -806,6 +943,8 @@ class StreamProcessor(proc_base.BaseProcessor):
                         self._sources,
                         extract_sources_from_card_attachment(card),
                     )
+                    if self.compat.suppress_media:
+                        continue
                     json_data = card.get("jsonData")
                     if isinstance(json_data, str) and json_data.strip():
                         try:
@@ -921,11 +1060,19 @@ class StreamProcessor(proc_base.BaseProcessor):
 class CollectProcessor(proc_base.BaseProcessor):
     """Non-stream response processor."""
 
-    def __init__(self, model: str, token: str = "", tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        compat: ClientCompatOptions | None = None,
+    ):
         super().__init__(model, token)
         self.filter_tags = get_config("app.filter_tags")
         self.tools = tools
         self.tool_choice = tool_choice
+        self.compat = compat or ClientCompatOptions()
 
     def _filter_content(self, content: str) -> str:
         """Filter special tags in content."""
@@ -966,7 +1113,7 @@ class CollectProcessor(proc_base.BaseProcessor):
         fingerprint = ""
         content = ""
         sources: list[dict[str, str]] = []
-        idle_timeout = get_config("chat.stream_timeout")
+        idle_timeout = _resolve_chat_idle_timeout(self.compat)
 
         try:
             async for line in proc_base._with_idle_timeout(
@@ -993,56 +1140,57 @@ class CollectProcessor(proc_base.BaseProcessor):
                         extract_sources_from_model_response(mr),
                     )
 
-                    card_map: dict[str, tuple[str, str]] = {}
-                    for raw in mr.get("cardAttachmentsJson") or []:
-                        if not isinstance(raw, str) or not raw.strip():
-                            continue
-                        try:
-                            card_data = orjson.loads(raw)
-                        except orjson.JSONDecodeError:
-                            continue
-                        if not isinstance(card_data, dict):
-                            continue
-                        card_id = card_data.get("id")
-                        image = card_data.get("image") or {}
-                        original = image.get("original")
-                        if not card_id or not original:
-                            continue
-                        title = image.get("title") or ""
-                        card_map[card_id] = (title, original)
+                    if not self.compat.suppress_media:
+                        card_map: dict[str, tuple[str, str]] = {}
+                        for raw in mr.get("cardAttachmentsJson") or []:
+                            if not isinstance(raw, str) or not raw.strip():
+                                continue
+                            try:
+                                card_data = orjson.loads(raw)
+                            except orjson.JSONDecodeError:
+                                continue
+                            if not isinstance(card_data, dict):
+                                continue
+                            card_id = card_data.get("id")
+                            image = card_data.get("image") or {}
+                            original = image.get("original")
+                            if not card_id or not original:
+                                continue
+                            title = image.get("title") or ""
+                            card_map[card_id] = (title, original)
 
-                    if content and card_map:
-                        def _render_card(match: re.Match) -> str:
-                            card_id = match.group(1)
-                            item = card_map.get(card_id)
-                            if not item:
-                                return ""
-                            title, original = item
-                            title_safe = title.replace("\n", " ").strip() or "image"
-                            prefix = ""
-                            if match.start() > 0:
-                                prev = content[match.start() - 1]
-                                if prev not in ("\n", "\r"):
-                                    prefix = "\n"
-                            return f"{prefix}![{title_safe}]({original})"
+                        if content and card_map:
+                            def _render_card(match: re.Match) -> str:
+                                card_id = match.group(1)
+                                item = card_map.get(card_id)
+                                if not item:
+                                    return ""
+                                title, original = item
+                                title_safe = title.replace("\n", " ").strip() or "image"
+                                prefix = ""
+                                if match.start() > 0:
+                                    prev = content[match.start() - 1]
+                                    if prev not in ("\n", "\r"):
+                                        prefix = "\n"
+                                return f"{prefix}![{title_safe}]({original})"
 
-                        content = re.sub(
-                            r'<grok:render[^>]*card_id="([^"]+)"[^>]*>.*?</grok:render>',
-                            _render_card,
-                            content,
-                            flags=re.DOTALL,
-                        )
-
-                    if urls := proc_base._collect_images(mr):
-                        content += "\n"
-                        for url in urls:
-                            parts = url.split("/")
-                            img_id = parts[-2] if len(parts) >= 2 else "image"
-                            dl_service = self._get_dl()
-                            rendered = await dl_service.render_image(
-                                url, self.token, img_id
+                            content = re.sub(
+                                r'<grok:render[^>]*card_id="([^"]+)"[^>]*>.*?</grok:render>',
+                                _render_card,
+                                content,
+                                flags=re.DOTALL,
                             )
-                            content += f"{rendered}\n"
+
+                        if urls := proc_base._collect_images(mr):
+                            content += "\n"
+                            for url in urls:
+                                parts = url.split("/")
+                                img_id = parts[-2] if len(parts) >= 2 else "image"
+                                dl_service = self._get_dl()
+                                rendered = await dl_service.render_image(
+                                    url, self.token, img_id
+                                )
+                                content += f"{rendered}\n"
 
                     if (
                         (meta := mr.get("metadata", {}))

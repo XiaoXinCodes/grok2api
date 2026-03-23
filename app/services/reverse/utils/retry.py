@@ -33,14 +33,18 @@ _TRANSPORT_RETRY_ERRORS = (
 class RetryContext:
     """Retry context."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        max_retry: int | None = None,
+        retry_budget: float | None = None,
+    ):
         self.attempt = 0
-        self.max_retry = int(get_config("retry.max_retry"))
+        self.max_retry = self._resolve_max_retry(max_retry)
         self.retry_codes = get_config("retry.retry_status_codes")
         self.last_error = None
         self.last_status = None
         self.total_delay = 0.0
-        self.retry_budget = float(get_config("retry.retry_budget"))
+        self.retry_budget = self._resolve_retry_budget(retry_budget)
 
         # Backoff parameters
         self.backoff_base = float(get_config("retry.retry_backoff_base"))
@@ -49,6 +53,18 @@ class RetryContext:
 
         # Decorrelated jitter state
         self._last_delay = self.backoff_base
+
+    @staticmethod
+    def _resolve_max_retry(value: int | None) -> int:
+        if value is None:
+            return int(get_config("retry.max_retry"))
+        return max(0, int(value))
+
+    @staticmethod
+    def _resolve_retry_budget(value: float | None) -> float:
+        if value is None:
+            return float(get_config("retry.retry_budget"))
+        return max(0.0, float(value))
 
     def should_retry(self, status_code: int, error: Exception = None) -> bool:
         """Check if should retry."""
@@ -162,6 +178,8 @@ async def retry_on_status(
     *args,
     extract_status: Callable[[Exception], Optional[int]] = None,
     on_retry: Callable[[int, int, Exception, float], Any] = None,
+    max_retry: int | None = None,
+    retry_budget: float | None = None,
     **kwargs,
 ) -> Any:
     """
@@ -181,7 +199,7 @@ async def retry_on_status(
     Raises:
         Last failed exception
     """
-    ctx = RetryContext()
+    ctx = RetryContext(max_retry=max_retry, retry_budget=retry_budget)
 
     # Status code extractor
     if extract_status is None:

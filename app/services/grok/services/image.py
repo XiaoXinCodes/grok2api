@@ -292,7 +292,7 @@ class ImageGenerationService:
             mode=model_info.model_mode,
             stream=True,
             tool_overrides={"imageGen": True},
-            request_overrides=self._app_chat_request_overrides(n, enable_nsfw),
+            payload_overrides=self._app_chat_request_overrides(n, enable_nsfw),
         )
         processor = AppChatImageStreamProcessor(
             model_info.model_id,
@@ -331,7 +331,7 @@ class ImageGenerationService:
                 mode=model_info.model_mode,
                 stream=True,
                 tool_overrides={"imageGen": True},
-                request_overrides=self._app_chat_request_overrides(
+                payload_overrides=self._app_chat_request_overrides(
                     call_target, enable_nsfw
                 ),
             )

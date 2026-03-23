@@ -106,7 +106,7 @@ class ImageEditService:
                         stream=True,
                         file_attachments=file_attachments,
                         tool_overrides=tool_overrides,
-                        request_overrides=request_overrides,
+                        payload_overrides=request_overrides,
                     )
                     processor = ImageStreamProcessor(
                         model_info.model_id,
@@ -211,7 +211,7 @@ class ImageEditService:
                 stream=True,
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
-                request_overrides=self._build_request_overrides(per_call),
+                payload_overrides=self._build_request_overrides(per_call),
             )
             processor = ImageCollectProcessor(
                 "grok-imagine-1.0-edit", token, response_format=response_format
